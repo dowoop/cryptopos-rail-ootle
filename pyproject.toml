@@ -1,0 +1,56 @@
+[project]
+name = "cryptopos-rail-ootle"
+version = "0.1.0"
+description = "A dependency-free Tari Ootle (esmeralda) XTR payment rail for CryptoPoS."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+# ONE DEPENDENCY, AND IT IS DECLARED. `cryptopos-rail-solana` 0.1.0 shipped with
+# `dependencies = []` while importing four core modules, so it installed cleanly
+# into an environment where it could not run. A range rather than a pin: these
+# rails use the PaymentRail protocol and the address and URI helpers, all of
+# which are covered by core's frozen API, so a core patch release must not force
+# a release here. The `<2` ceiling is deliberate -- a major core release is
+# where those helpers could move, and an unbounded range would let a resolver
+# pair this wheel with a core that no longer has them.
+# `>=2`, NOT `>=1.1`, and that was measured rather than reasoned. Core 1.1
+# ships these adapters itself and declares its own `cryptopos.rails` entry
+# points for them, so installing this package beside it registers one rail key
+# twice and `RailRegistry.discover()` raises:
+#
+#     DuplicateRail: More than one payment-rail plugin registered
+#     'bitcoin:testnet4/native:btc'.
+#
+# That is not a degraded mode -- discovery fails outright, so a host loses every
+# rail, not just the duplicated one. A `<2` ceiling would have permitted exactly
+# that combination. This package is a core 2.0 artifact and says so.
+dependencies = ["cryptopos-core>=2,<3"]
+
+[project.entry-points."cryptopos.rails"]
+ootle-esmeralda-xtr = "cryptopos_rail_ootle:ootle_esmeralda"
+
+[project.urls]
+Source = "https://github.com/dowoop/cryptopos-rail-ootle"
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cryptopos_rail_ootle"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "pyproject.toml", "README.md"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "I", "UP", "B", "RUF"]
+ignore = ["E501", "W191"]
