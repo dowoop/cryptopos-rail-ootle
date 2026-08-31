@@ -2,6 +2,29 @@
 
 A [Tari Ootle](https://ootle.tari.com) (esmeralda) XTR payment rail for [CryptoPoS](https://github.com/dowoop/cryptopos-core), read over the indexer's REST and server-sent-event API.
 
+> ### ⚠ A payment is bound to a sale only by "first open sale the money covers"
+>
+> Deposits land in **one shared merchant account**, so this rail cannot tell you
+> who a payment was for. Settlement credits every unclaimed, timely deposit into
+> that account and settles when the running total reaches the invoice. It does
+> **not** match the amount, and it fails without an attacker:
+>
+> 1. Sale A (invoice 100,000 µXTR) and sale B (invoice 5,000,000 µXTR) are both open.
+> 2. B's customer pays 5,000,000 µXTR.
+> 3. A polls first, sees an unclaimed timely deposit, and its total covers its invoice.
+> 4. **A settles — credited 5,000,000 µXTR against a 100,000 µXTR invoice.**
+> 5. B, whose customer actually paid, ends `needs-review` credited nothing.
+>
+> Reproduced against this adapter, not theorised. Two deposits also **sum**:
+> 3,000,000 + 2,000,000 settles a 5,000,000 invoice. Because the test is a
+> running total rather than equality, **making each sale's amount unique does
+> not fix this.**
+>
+> A deposit carries a transaction id, so a host keeping a claimed-transaction
+> set can stop one transaction being credited twice. Nothing here can tell two
+> concurrent sales apart. Do not accept real money on this rail without a
+> per-sale binding the host owns.
+
 > **Proven through this published wheel.** On 2026-08-31 a real esmeralda
 > payment of 3,141,592 µXTR was charged, observed and settled through this
 > package installed as a wheel and resolved through the `cryptopos.rails`
@@ -67,8 +90,10 @@ searched for, not found — so `create_request` returns the recipient's account
 address with a notice saying exactly that. This package will not invent a URI
 scheme to make the request look tidier.
 
-**The binding is a static account.** Deposits land in one merchant account, so a
-payment is matched by amount within the lock window. Ootle *can* do better: a
+**The binding is a static account.** Deposits land in one merchant account, and
+a payment is credited by **running total, not by amount match** — see the
+warning at the top of this file for the exact sequence and why unique amounts
+are not a remedy. Ootle *can* do better: a
 payment component taking a sale reference as an argument would bind exactly,
 which is the one chain here where the sale id could be an argument rather than
 an inference. That is a smart contract, not an adapter change, and it is not in
