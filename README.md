@@ -2,12 +2,20 @@
 
 A [Tari Ootle](https://ootle.tari.com) (esmeralda) XTR payment rail for [CryptoPoS](https://github.com/dowoop/cryptopos-core), read over the indexer's REST and server-sent-event API.
 
-> ### ⚠ A payment is bound to a sale only by "first open sale the money covers"
+> ### ⚠ Two bindings, and the HOST chooses which one it gets
 >
-> Deposits land in **one shared merchant account**, so this rail cannot tell you
-> who a payment was for. Settlement credits every unclaimed, timely deposit into
-> that account and settles when the running total reaches the invoice. It does
-> **not** match the amount, and it fails without an attacker:
+> **With a payment component (`payment_component` in the rail's configuration)
+> the money names the sale.** The payer calls the component's `pay` method with
+> the sale reference; the deposit event carries that reference, and this rail
+> credits only deposits naming the sale it is settling. Nothing is inferred
+> from amount, timing or polling order. That is the mode to use, and it is what
+> `cryptopos-rail-ootle` 0.2.0 added.
+>
+> **Without one, deposits land in one shared merchant account and this rail
+> cannot tell you who a payment was for.** Settlement credits every unclaimed,
+> timely deposit into that account and settles when the running total reaches
+> the invoice. It does **not** match the amount, and it fails without an
+> attacker:
 >
 > 1. Sale A (invoice 100,000 µXTR) and sale B (invoice 5,000,000 µXTR) are both open.
 > 2. B's customer pays 5,000,000 µXTR.
@@ -21,15 +29,27 @@ A [Tari Ootle](https://ootle.tari.com) (esmeralda) XTR payment rail for [CryptoP
 > not fix this.**
 >
 > A deposit carries a transaction id, so a host keeping a claimed-transaction
-> set can stop one transaction being credited twice. Nothing here can tell two
-> concurrent sales apart. Do not accept real money on this rail without a
-> per-sale binding the host owns.
+> set can stop one transaction being credited twice. Nothing in the shared mode
+> can tell two concurrent sales apart. **Do not accept real money on the shared
+> account.** Configure a payment component, or supply a per-sale binding the
+> host owns.
+>
+> The rail does not decide which mode it is in and cannot: a host that reports a
+> binding to its operator must compute it from its own configuration, because
+> the same adapter is per-sale with a component and shared without one.
 
 > **Proven through this published wheel.** On 2026-08-31 a real esmeralda
 > payment of 3,141,592 µXTR was charged, observed and settled through this
 > package installed as a wheel and resolved through the `cryptopos.rails`
 > entry point — transaction
 > `d661a4399f3afe5bc77e0f8e03e8245a2a653eaded5d17475c93953f1090d720`.
+>
+> The per-sale binding added in 0.2.0 was proven on the same network the same
+> day, through the host this package was extracted from: a sale charged, paid
+> by a wallet holding a key the merchant has never seen, settled and booked.
+> A payment naming the **wrong** sale reference, for the exactly correct
+> amount, into the correct component, was refused — which is the stronger
+> evidence, because it is the case the shared account gets wrong.
 
 **Not audited.** No external security audit; never used with mainnet funds.
 
@@ -83,21 +103,44 @@ rather than a gap: Ootle commits are final, there is no reorg to outlive, and
 waiting "three more of something" would be waiting for a thing that does not
 happen.
 
-## Two limits, stated rather than buried
+## Five limits, stated rather than buried
 
 **There is no payment URI.** Ootle publishes no registered deeplink scheme —
 searched for, not found — so `create_request` returns the recipient's account
 address with a notice saying exactly that. This package will not invent a URI
 scheme to make the request look tidier.
 
-**The binding is a static account.** Deposits land in one merchant account, and
-a payment is credited by **running total, not by amount match** — see the
-warning at the top of this file for the exact sequence and why unique amounts
-are not a remedy. Ootle *can* do better: a
-payment component taking a sale reference as an argument would bind exactly,
-which is the one chain here where the sale id could be an argument rather than
-an inference. That is a smart contract, not an adapter change, and it is not in
-this package.
+**The binding depends on the host's configuration.** Without a payment
+component, deposits land in one merchant account and a payment is credited by
+**running total, not by amount match** — see the warning at the top of this
+file for the exact sequence and why unique amounts are not a remedy. With one,
+the payer names the sale on the transfer itself and only that sale's money is
+credited. The component is a smart contract rather than an adapter change; this
+package drives it and does not contain it.
+
+**A baseline is drained, and a read that stops short is not a baseline.**
+`capture_baseline` replays the event stream until a page adds nothing, rather
+than accepting the first read. A single bounded read over a long history hands
+back a cursor in the middle of the past, and every deposit after that cursor —
+money that arrived before the sale existed — then looks like a payment for it.
+Settlement bounds the window at **both** ends as well, with an hour of clock
+skew allowed, so a deposit predating its sale goes to review rather than
+settling. A history too long to drain is a refusal: no sale is charged against
+a starting point this rail knows it cannot trust.
+
+**A transaction the indexer does not call committed cannot settle a sale.**
+Ootle finality is a property of a *committed* transaction, so the outcome is
+read and checked rather than assumed. An `Abort`, a `Reject`, or a summary this
+build cannot read is reported as an unconfirmed transfer with the outcome
+named — never silently dropped, because an indexer wrong about an abort would
+otherwise rob a customer who really paid.
+
+**Every read of the event stream costs its full timeout.** The endpoint
+documents a `:` comment while idle and, measured against
+`ootle-indexer-a.tari.com` on 2026-08-31, never sends one: a replay from
+`after_id=0` returned five events in 4.56 s and the next read returned no bytes
+in 4.34 s. So the end of a history looks like silence, and a drained baseline
+costs two reads. Budget for it.
 
 ## Also included
 
@@ -122,4 +165,5 @@ No test in this package opens a socket.
 
 ## Licence
 
-MIT.
+MIT — the full text is in [`LICENSE`](LICENSE), which ships in the sdist
+and the wheel.

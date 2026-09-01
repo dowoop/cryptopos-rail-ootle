@@ -149,8 +149,20 @@ class OotleReader:
 		"""GET a bounded SSE replay. Returns (UTF-8 bytes, None) or (None, reason).
 
 		The transaction event endpoint stays open and sends ``:`` while idle.
-		That comment is the replay boundary: stop there instead of asking a
+		That comment is a replay boundary: stop there instead of asking a
 		request handler to wait forever for a response body that never closes.
+
+		**It is not the boundary that actually occurs, measured 2026-08-31.**
+		Against `ootle-indexer-a.tari.com` the comment never arrived at all: a
+		read from `after_id=0` returned 1,983 bytes and five events in 4.56 s
+		ending on a complete data frame, and the next read from that cursor
+		returned NO BYTES in 4.34 s. So on this endpoint **every** call ends at
+		the timeout below and costs the full budget, and the end of a history
+		looks like silence rather than a marker. Anything relying on the
+		comment to know it has read everything will be wrong here --
+		`ootle.OotleEsmeralda._drain` is written around the silence for exactly
+		that reason, and the sentence above is kept because a different
+		indexer, or a later version of this one, may well send it.
 		"""
 		if self._indexer_error:
 			return None, self._indexer_error
@@ -176,8 +188,15 @@ class OotleReader:
 				headers={"Accept": "text/event-stream", "User-Agent": self.user_agent},
 			)
 			payload = bytearray()
+			connected = False
 			try:
 				with _urlopen(request, timeout=self.timeout) as response:
+					# THE CONNECTION WAS ESTABLISHED. Everything after this
+					# point is the server choosing what to send, which is a
+					# different kind of answer from never reaching it -- see
+					# the `except OSError` below, where that distinction is
+					# the whole of the fix.
+					connected = True
 					while True:
 						line = response.readline(MAX_RESPONSE_BYTES + 1 - len(payload))
 						payload.extend(line)
@@ -186,29 +205,45 @@ class OotleReader:
 						if not line or line.startswith(b":"):
 							break
 			except OSError:
-				# A TIMEOUT WITH FRAMES ALREADY IN HAND IS THE END OF THE
-				# REPLAY, NOT A FAILURE. The endpoint replays history and then
-				# holds the connection open, so the `:` comment above is the
-				# ordinary boundary -- but it only arrives when the server
-				# decides to send it, and the app hands this reader a 4 second
-				# budget. Measured 2026-08-31: charging on `xtr` inside the
-				# host's containers failed with "the indexer did not answer:
-				# The read operation timed out" while the frames for a real
-				# settled payment were already in `payload` and were thrown
-				# away with them.
+				# A READ THAT ENDED AT THE TIMEOUT IS AN ANSWER, NOT A FAILURE
+				# -- but only once the connection was established.
 				#
-				# Discarding them would be worse than slow: the events are
-				# cursor-addressed, so a partial read is not a partial answer.
-				# It is a SHORTER answer, and the next poll resumes from the
-				# last id it did see. Nothing is skipped and nothing is
-				# double-counted. Only an empty payload is a real silence.
+				# The endpoint replays history and then holds the connection
+				# open. The `:` comment above is its documented boundary and
+				# esmeralda never sends one (measured 2026-08-31: a replay from
+				# `after_id=0` returned five events in 4.56 s ending on a
+				# complete data frame; the next read returned zero bytes in
+				# 4.34 s). So on this endpoint EVERY read ends here, and what
+				# the server sent before the budget ran out is the answer.
+				#
+				# Frames in hand are a SHORTER answer, not a partial one: the
+				# events are cursor-addressed, so the next poll resumes from
+				# the last id seen. Nothing is skipped and nothing is
+				# double-counted.
+				#
+				# **And no bytes is the answer "nothing after your cursor".**
+				# It used to re-raise, which made an idle stream look identical
+				# to a dead one -- so a brand-new payment component, whose
+				# stream is legitimately empty, could not have its first sale
+				# charged at all. Reproduced 2026-08-31.
+				#
+				# `connected` is what keeps that honest, and it is the half
+				# that matters for money. A DNS failure, a refused connection
+				# or a TLS error never sets it, so those still return None and
+				# a caller must refuse. The distinction the caller needs is
+				# "the endpoint had nothing more" versus "the endpoint did not
+				# answer", and before this the two were the same value:
+				# `ootle._drain` accepted an HTTP 503 on its second page as the
+				# end of the history, and a pre-existing deposit then settled a
+				# new sale. Reproduced, and it is the reason this branch is
+				# written out at this length.
 				#
 				# `OSError` rather than `TimeoutError`: on 3.9 a read timeout
 				# arrives as `socket.timeout`, which is an OSError and NOT a
 				# TimeoutError. Catching the base covers both without importing
-				# `socket`, and any other read interruption after valid frames
-				# deserves the same treatment for the same reason.
-				if not payload:
+				# `socket`, and any other read interruption after a successful
+				# connect deserves the same treatment for the same reason.
+				if not connected:
 					raise
 			return bytes(payload), None
 		except urllib.error.HTTPError as exception:

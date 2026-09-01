@@ -11,7 +11,9 @@ import cryptopos_rail_ootle.chain as chain
 from cryptopos_rail_ootle.chain import OotleReader
 from cryptopos_core.errors import InvalidRailPlugin, RailProviderError
 from cryptopos_rail_ootle import (
+	MAX_SALE_REF_BYTES,
 	OOTLE_DEPOSIT_TOPIC,
+	OOTLE_PAYMENT_TOPIC,
 	OOTLE_XTR_RESOURCE,
 	OotleEsmeralda,
 	_event_replay,
@@ -44,6 +46,7 @@ ACCOUNT = "component_0123456789abcdef0123456789abcdef0123456789abcdef0123456789a
 VAULT = "vault_eec5267fad8a680632b447214a0728ec7d6aa8d275c81a377c2cd5296a387518"
 TX = "157954d6ee23d88a450d2c544d77509f6a8912a141d195dc6c61ff6c10d76696"
 TX_TWO = "2" * 64
+TX_THREE = "3" * 64
 FINALIZED = "2026-08-31 03:34:19.0"
 FINALIZED_EPOCH = 1_788_147_259
 
@@ -153,7 +156,22 @@ class Transport:
 			return Response(json.dumps(vault_body(self.balance, self.kind)).encode())
 		if parts.path.endswith("/transactions/events/stream"):
 			after_id = int(urllib.parse.parse_qs(parts.query)["after_id"][0])
-			return Response(self.streams.get(after_id, b":\n"))
+			body = self.streams.get(after_id, b":\n")
+			if body is None:
+				# WHAT THE LIVE INDEXER DOES when there is nothing after the
+				# cursor: it holds the connection open and sends nothing, so
+				# the read hits its own timeout with an empty buffer. That is
+				# an ANSWER -- the endpoint was reached and had nothing more --
+				# and `chain._get_sse` returns the empty bytes rather than
+				# re-raising, because it tracks whether the connection was
+				# established. `None` in a stream table means exactly that.
+				return Response(b"")
+			if body == "unreachable":
+				# The other kind of nothing: never connected. This is what must
+				# stay a refusal, and conflating the two is what let a 503 end
+				# a drain early and settle a sale on money that predated it.
+				raise urllib.error.URLError("connection refused")
+			return Response(body)
 		transaction_id = parts.path.rsplit("/", 1)[-1]
 		if "/transactions/" in parts.path and transaction_id in self.transactions:
 			return Response(json.dumps(self.transactions[transaction_id]).encode())
@@ -220,12 +238,111 @@ class OotleRailTest(unittest.TestCase):
 		baseline = self.baseline(transport)
 		self.assertEqual(baseline.tip, 247500)
 		self.assertEqual(baseline.balance_native, 999997692)
-		stream_url, timeout, accept = transport.calls[-1]
-		query = urllib.parse.parse_qs(urllib.parse.urlsplit(stream_url).query)
-		self.assertEqual(query["substate_id"], [VAULT])
-		self.assertEqual(query["topic"], [OOTLE_DEPOSIT_TOPIC])
-		self.assertEqual(query["after_id"], ["0"])
+		streams = [url for url, _timeout, _accept in transport.calls if "events/stream" in url]
+		queries = [urllib.parse.parse_qs(urllib.parse.urlsplit(url).query) for url in streams]
+		self.assertEqual(queries[0]["substate_id"], [VAULT])
+		self.assertEqual(queries[0]["topic"], [OOTLE_DEPOSIT_TOPIC])
+		# DRAINED, not read once. The first page answered and the second
+		# confirmed there was nothing after it; a baseline is only the tip if
+		# something asked whether anything followed.
+		self.assertEqual([query["after_id"] for query in queries], [["0"], ["247500"]])
+		_url, timeout, accept = transport.calls[-1]
 		self.assertEqual((timeout, accept), (2, "text/event-stream"))
+
+	def test_a_baseline_is_the_end_of_the_history_not_the_end_of_one_read(self):
+		"""The defect: a short read made "nothing before this is mine" false.
+
+		`chain._get_sse` returns what it has when the budget runs out, which is
+		right for observation and wrong here. A shared account with more
+		history than four seconds of replay used to hand back a cursor in the
+		MIDDLE of its past, and every deposit after that cursor -- money that
+		arrived before the sale existed -- then looked like a payment for it.
+		"""
+		transport = Transport(
+			streams={
+				0: event_frame(10, amount="1"),
+				10: event_frame(20, TX_TWO, "1"),
+				20: event_frame(30, TX_THREE, "1"),
+			},
+		)
+		self.assertEqual(self.baseline(transport).tip, 30)
+
+	def test_a_history_that_never_ends_refuses_rather_than_guessing(self):
+		"""A baseline that cannot be established is not a baseline of zero."""
+		endless = {identifier: event_frame(identifier + 1) for identifier in range(0, 40)}
+		with self.assertRaises(RailProviderError) as refused:
+			self.baseline(Transport(streams=endless))
+		self.assertIn("no baseline can be trusted", refused.exception.reason)
+
+	def test_a_stream_that_ends_in_silence_still_drains(self):
+		"""What esmeralda ACTUALLY does, measured 2026-08-31.
+
+		`_get_sse` documents a `:` idle comment as the replay boundary. On the
+		live indexer that comment never arrives: a read from `after_id=0`
+		returned five events in 4.56 s ending on a complete data frame, and the
+		next read from that cursor returned NO BYTES in 4.34 s. The first
+		version of the drain treated the second as a failure and refused every
+		baseline on the deployment it was written for.
+
+		Silence is end-of-history only AFTER a page has answered, which is what
+		the next test is the control for.
+		"""
+		transport = Transport(streams={0: event_frame(41, amount="3")})
+		transport.streams[41] = None            # a read that returns nothing
+		baseline = self.baseline(transport)
+		self.assertEqual(baseline.tip, 41)
+
+	def test_an_endpoint_that_is_simply_down_is_still_a_refusal(self):
+		"""THE CONTROL, and the distinction the whole design rests on.
+
+		"The endpoint had nothing more" and "the endpoint did not answer" are
+		both an absence of bytes, and for one afternoon this code treated them
+		as the same value. A review reproduced what that cost: an HTTP 503 on
+		the drain's second page ended the replay early, and a deposit made
+		before the sale existed then settled it.
+
+		`chain._get_sse` separates them by whether the connection was ever
+		established, so an unreachable endpoint can never look like an empty
+		history.
+		"""
+		transport = Transport(streams={0: "unreachable"})
+		with self.assertRaises(RailProviderError) as refused:
+			self.baseline(transport)
+		self.assertIn("event stream could not be read", refused.exception.reason)
+
+	def test_a_transport_failure_part_way_through_a_drain_refuses(self):
+		"""The reproduced defect, pinned as a regression.
+
+		Page one answers, page two fails. Accepting page one's cursor as the
+		end of the history is what let pre-existing money settle a new sale --
+		so the baseline must refuse rather than return a cursor it cannot
+		stand behind.
+		"""
+		transport = Transport(streams={0: event_frame(100, amount="1"), 100: "unreachable"})
+		with self.assertRaises(RailProviderError) as refused:
+			self.baseline(transport)
+		self.assertIn("event stream could not be read", refused.exception.reason)
+
+	def test_a_stream_that_answers_with_nonsense_refuses_at_every_attempt(self):
+		"""Silence and nonsense are different answers and must not collapse."""
+		transport = Transport(streams={0: event_frame(41), 41: b"id: 42\ndata: {}\n\n"})
+		with self.assertRaises(RailProviderError) as refused:
+			self.baseline(transport)
+		self.assertIn("event, id, and data", refused.exception.reason)
+
+	def test_the_page_bound_is_exactly_twelve_and_both_sides_are_asserted(self):
+		"""Where the refusal starts, not merely that one exists somewhere.
+
+		Eleven pages of history plus the empty page that ends them is twelve
+		reads and must succeed; twelve pages that keep answering must refuse.
+		Without both sides the bound can drift by one and nothing notices.
+		"""
+		eleven = {identifier: event_frame(identifier + 1) for identifier in range(0, 11)}
+		self.assertEqual(self.baseline(Transport(streams=eleven)).tip, 11)
+
+		twelve = {identifier: event_frame(identifier + 1) for identifier in range(0, 12)}
+		with self.assertRaises(RailProviderError):
+			self.baseline(Transport(streams=twelve))
 
 	def test_observe_returns_the_recorded_attributed_final_deposit(self):
 		baseline = self.baseline()
@@ -290,11 +407,55 @@ class OotleRailTest(unittest.TestCase):
 		baseline = self.baseline()
 		observed = self.observe(
 			self.intent(baseline),
-			Transport(streams={0: event_frame(7) + b":\n"}),
+			Transport(
+				streams={0: event_frame(7) + b":\n"},
+				# COMMITTED, with a timestamp nothing can parse. The outcome is
+				# spelled out so this test keeps testing what it is named for:
+				# without it the transfer is refused for having no outcome and
+				# the timestamp path is never reached.
+				transactions={TX: {"transaction": {"summary": {"outcome": "Commit", "finalized_at": "yesterday"}}}},
+			),
 		)
 		self.assertIsNone(observed.transfers[0].block_time_epoch)
+		# STILL CONFIRMED, and confirmed once. The transaction committed -- only
+		# its clock is unreadable -- so this is not the uncommitted case and
+		# must not be recorded as though the money had not moved.
+		self.assertEqual((observed.transfers[0].confirmed, observed.transfers[0].confirmations), (True, 1))
 		self.assertIn("no trustworthy finalized_at", observed.warnings[0])
 		self.assertEqual(self.rail.settle(self.intent(baseline), observed).state, NEEDS_REVIEW)
+
+	def test_a_transaction_the_indexer_says_aborted_cannot_settle_a_sale(self):
+		"""Reproduced 2026-08-31, on both paths, before it was fixed.
+
+		`settle` has always answered "committed Ootle deposits are final", and
+		nothing read the outcome. A summary saying `Abort` beside a valid
+		timestamp settled a 5,000,000 microTari sale and booked it -- the
+		guarantee was asserted over a transaction that had never been checked
+		against it. The money is still REPORTED, so an operator sees it; it is
+		reported unconfirmed, so nothing can count it.
+		"""
+		for outcome, named in (("Abort", "'Abort'"), ("Reject", "'Reject'"), (None, "no outcome at all")):
+			with self.subTest(outcome=outcome):
+				summary = {"finalized_at": FINALIZED}
+				if outcome is not None:
+					summary["outcome"] = outcome
+				baseline = self.baseline()
+				observed = self.observe(
+					self.intent(baseline),
+					Transport(
+						streams={0: event_frame(7) + b":\n"},
+						transactions={TX: {"transaction": {"summary": summary}}},
+					),
+				)
+				self.assertEqual(observed.transfers[0].confirmed, False)
+				self.assertEqual(observed.transfers[0].confirmations, 0)
+				self.assertIsNone(observed.transfers[0].block_time_epoch)
+				self.assertIn("not committed", observed.warnings[0])
+				self.assertIn(named, observed.warnings[0])
+				decision = self.rail.settle(self.intent(baseline), observed)
+				self.assertEqual(decision.state, NEEDS_REVIEW)
+				self.assertEqual(decision.credited_native, 0)
+				self.assertIn("not committed", decision.reason)
 
 	def test_payment_request_is_an_address_instruction_not_an_invented_uri(self):
 		baseline = self.baseline()
@@ -387,7 +548,15 @@ class OotleRailTest(unittest.TestCase):
 		late = TransferObservation(TX_TWO, 30, True, 1, block_time_epoch=FINALIZED_EPOCH + 61)
 		late_decision = self.rail.settle(intent, self.batch(baseline, timely, late))
 		self.assertEqual(late_decision.state, NEEDS_REVIEW)
-		self.assertIn("after expiry", late_decision.reason)
+		# "outside the sale's window", not "after expiry". D57 bounded the
+		# window at BOTH ends, so a deposit dated before the sale existed lands
+		# here too and the old sentence was false for half of what reaches it.
+		self.assertIn("outside the sale's window", late_decision.reason)
+
+		early = TransferObservation(TX_TWO, 30, True, 1, block_time_epoch=intent.created_at_epoch - 7_200)
+		early_decision = self.rail.settle(intent, self.batch(baseline, timely, early))
+		self.assertEqual(early_decision.state, NEEDS_REVIEW)
+		self.assertIn("outside the sale's window", early_decision.reason)
 
 		unknown = TransferObservation(TX_TWO, 30, True, 1)
 		unknown_decision = self.rail.settle(intent, self.batch(baseline, timely, unknown))
@@ -530,12 +699,41 @@ class EventReplayBoundaries(unittest.TestCase):
 		reader = mock.Mock()
 		reader._get.return_value = ({"transaction": {"summary": {"outcome": "Commit", "finalized_at": FINALIZED}}}, None)
 		body = json.loads(event_frame(1, amount="1").split(b"data: ", 1)[1])
-		transfers, warnings = rail._transfers(reader, VAULT, ((1, OOTLE_DEPOSIT_TOPIC, body),))
+		transfers, warnings, _unresolved = rail._transfers(reader, VAULT, ((1, OOTLE_DEPOSIT_TOPIC, body),))
 		self.assertEqual(transfers[0].amount_native, 1)
 		self.assertEqual(warnings, ())
 
 
 class SseTransportBoundaries(unittest.TestCase):
+
+	def test_a_connection_that_goes_quiet_answers_empty_and_one_that_fails_does_not(self):
+		"""The distinction the drain rests on, at the layer that makes it.
+
+		Both are an absence of bytes. An established connection that then goes
+		quiet is the endpoint saying "nothing after your cursor" -- esmeralda
+		never sends the `:` marker, so this is how EVERY read ends there. A
+		connection that was never established is a failure, and returning
+		empty bytes for it would let a dead endpoint look like an empty
+		history: an HTTP 503 mid-drain then ends the replay early and money
+		that predates a sale settles it. Reproduced 2026-08-31.
+		"""
+
+		class Quiet(Response):
+			def readline(self, *_args):
+				raise OSError("The read operation timed out")
+
+		with mock.patch.object(chain, "_urlopen", lambda *_a, **_k: Quiet(b"")):
+			payload, reason = OotleReader(indexer=ENDPOINT)._get_sse("events")
+		self.assertEqual((payload, reason), (b"", None))
+
+		def refuse(*_args, **_kwargs):
+			raise urllib.error.URLError("connection refused")
+
+		with mock.patch.object(chain, "_urlopen", refuse):
+			payload, reason = OotleReader(indexer=ENDPOINT)._get_sse("events")
+		self.assertIsNone(payload)
+		self.assertIn("did not answer", reason)
+
 	def test_stream_read_stops_at_idle_comment_and_never_reads_again(self):
 		class IdleResponse(Response):
 			def __init__(self):
@@ -648,3 +846,646 @@ class SummaryField(unittest.TestCase):
 		self.assertIsNone(
 			_summary_field({"transaction": {"summary": {"outcome": "Commit"}}}, "finalized_at")
 		)
+
+
+# ---------------------------------------------------------------------------
+# The payment component: a per-sale binding, and the failure it removes.
+# ---------------------------------------------------------------------------
+
+_COMPONENT = "component_" + "1d" * 32
+_INDEXER = "https://indexer.example"
+
+
+def _payment_stream(*rows):
+	"""An SSE body in the shape esmeralda really emits.
+
+	Measured 2026-08-31 against the deployed loyalty contract, whose
+	`emit_event("PointsIssued", ...)` is indexed as `Loyalty.PointsIssued`
+	with the metadata verbatim in `event.payload`. Filtering on the bare event
+	name returns an EMPTY stream, which is indistinguishable from "this chain
+	does not index custom events" -- so the namespaced topic is the thing
+	under test here, not an incidental detail.
+	"""
+	frames = []
+	for event_id, sale_ref, amount in rows:
+		frames.append(
+			"event: %s\nid: %d\ndata: %s\n"
+			% (
+				OOTLE_PAYMENT_TOPIC,
+				event_id,
+				json.dumps(
+					{
+						"transaction_id": "%064x" % event_id,
+						"event": {
+							"substate_id": _COMPONENT,
+							"template_address": "985d07cc",
+							"payload": {
+								"epoch": "10766",
+								"sale_ref": sale_ref,
+								"amount": str(amount),
+							},
+						},
+					}
+				),
+			)
+		)
+	return ("\n".join(frames) + "\n").encode("utf-8")
+
+
+class _StubReader:
+	"""Just enough indexer to drive the component path, offline."""
+
+	indexer = _INDEXER
+
+	def __init__(self, stream, outcome="Commit"):
+		self._stream = stream
+		self._outcome = outcome
+
+	def _get_sse(self, _path):
+		return self._stream, None
+
+	def _get(self, path):
+		if path == "network":
+			return {"network": "esmeralda", "epoch": 10776}, None
+		# The measured envelope: `summary` sits beside the inner transaction,
+		# not under it. A flat or over-nested read returns None for every real
+		# transaction, which routes an honest payment to review.
+		return (
+			{
+				"transaction": {
+					"transaction_id": path.rsplit("/", 1)[-1],
+					"transaction": {},
+					"summary": {"outcome": self._outcome, "finalized_at": "2026-08-31 04:12:19.0"},
+				}
+			},
+			None,
+		)
+
+
+class PaymentComponentBinding(unittest.TestCase):
+	def setUp(self):
+		self.rail = OotleEsmeralda()
+		self.configuration = {"endpoint": _INDEXER, "payment_component": _COMPONENT}
+
+	def _with_stream(self, stream, outcome="Commit"):
+		reader = _StubReader(stream, outcome)
+		patch = mock.patch.object(OotleEsmeralda, "_reader", lambda _self, _cfg: reader)
+		patch.start()
+		self.addCleanup(patch.stop)
+		return reader
+
+	def _intent(self, name, amount):
+		return PaymentIntent(
+			name,
+			self.rail.key,
+			_COMPONENT,
+			amount,
+			1_000,
+			9_999_999_999,
+			payment_reference=name,
+			baseline=RecipientBaseline(
+				self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+
+	def test_a_payment_naming_this_sale_still_cannot_settle_it_if_it_aborted(self):
+		"""The binding says WHOSE money it is; the outcome says whether it moved.
+
+		The per-sale binding is the stronger guarantee and it is not this one.
+		A payment event naming exactly this sale, for exactly the invoiced
+		amount, from a transaction the indexer itself reports as aborted, used
+		to settle and book. Both checks are needed and neither substitutes for
+		the other.
+		"""
+		self._with_stream(_payment_stream((201, "SALE-B", 5_000_000)), outcome="Abort")
+		paid = self._intent("SALE-B", 5_000_000)
+		observed = self.rail.observe(paid, self.configuration)
+		self.assertIn("not committed", observed.warnings[0])
+		decision = self.rail.settle(paid, observed, frozenset())
+		self.assertEqual(decision.state, NEEDS_REVIEW)
+		self.assertEqual(decision.credited_native, 0)
+
+	def test_a_payment_settles_only_the_sale_it_names(self):
+		"""D48's exact scenario, which the shared account got wrong.
+
+		Sale A invoiced 100,000 uT and its customer paid nothing. Sale B
+		invoiced 5,000,000 uT and its customer paid. On the shared account A
+		settled on B's money because A polled first, and B ended
+		`needs-review` credited nothing. The reference removes the inference.
+		"""
+		self._with_stream(_payment_stream((201, "SALE-B", 5_000_000)))
+
+		unpaid = self._intent("SALE-A", 100_000)
+		decision = self.rail.settle(unpaid, self.rail.observe(unpaid, self.configuration), frozenset())
+		self.assertEqual(decision.state, PENDING)
+		self.assertEqual(decision.credited_native, 0)
+
+		paid = self._intent("SALE-B", 5_000_000)
+		decision = self.rail.settle(paid, self.rail.observe(paid, self.configuration), frozenset())
+		self.assertEqual(decision.state, SETTLED)
+		self.assertEqual(decision.credited_native, 5_000_000)
+
+	def test_two_sales_paid_at_once_credit_their_own_payments(self):
+		self._with_stream(
+			_payment_stream((301, "SALE-A", 100_000), (302, "SALE-B", 5_000_000))
+		)
+		for name, amount in (("SALE-A", 100_000), ("SALE-B", 5_000_000)):
+			intent = self._intent(name, amount)
+			decision = self.rail.settle(
+				intent, self.rail.observe(intent, self.configuration), frozenset()
+			)
+			self.assertEqual(decision.state, SETTLED, name)
+			self.assertEqual(decision.credited_native, amount, name)
+
+	def test_an_event_carrying_no_sale_reference_is_refused(self):
+		body = json.dumps(
+			{
+				"transaction_id": "%064x" % 401,
+				"event": {
+					"substate_id": _COMPONENT,
+					"template_address": "985d07cc",
+					"payload": {"amount": "5000000"},
+				},
+			}
+		)
+		self._with_stream(("event: %s\nid: 401\ndata: %s\n" % (OOTLE_PAYMENT_TOPIC, body)).encode())
+		intent = self._intent("SALE-A", 5_000_000)
+		with self.assertRaises(RailProviderError):
+			self.rail.observe(intent, self.configuration)
+
+	def test_an_event_for_another_component_is_refused(self):
+		body = json.dumps(
+			{
+				"transaction_id": "%064x" % 501,
+				"event": {
+					"substate_id": "component_" + "ee" * 32,
+					"template_address": "985d07cc",
+					"payload": {"sale_ref": "SALE-A", "amount": "5000000"},
+				},
+			}
+		)
+		self._with_stream(("event: %s\nid: 501\ndata: %s\n" % (OOTLE_PAYMENT_TOPIC, body)).encode())
+		intent = self._intent("SALE-A", 5_000_000)
+		with self.assertRaises(RailProviderError):
+			self.rail.observe(intent, self.configuration)
+
+	def test_a_sale_with_no_reference_cannot_use_a_payment_component(self):
+		self._with_stream(_payment_stream((601, "SALE-A", 5_000_000)))
+		intent = PaymentIntent(
+			"SALE-A",
+			self.rail.key,
+			_COMPONENT,
+			5_000_000,
+			1_000,
+			9_999_999_999,
+			baseline=RecipientBaseline(
+				self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		with self.assertRaises(RailProviderError):
+			self.rail.observe(intent, self.configuration)
+
+	def test_a_malformed_payment_component_is_refused(self):
+		for component in ("not-a-component", "component_zz", 7, []):
+			with self.subTest(component=component):
+				with self.assertRaises(RailProviderError):
+					self.rail._payment_component({"payment_component": component})
+
+	def test_the_request_tells_the_payer_to_name_the_sale(self):
+		intent = self._intent("SALE-A", 5_000_000)
+		request = self.rail.create_request(intent)
+		self.assertEqual(request.recipient, _COMPONENT)
+		self.assertEqual(request.uri, _COMPONENT)
+		self.assertIn("SALE-A", request.payer_notice)
+		self.assertIn("pay", request.payer_notice)
+		# The warning that stops a plain transfer, which would land in the
+		# component's vault naming no sale and never be credited.
+		self.assertIn("not be credited", request.payer_notice)
+
+	def test_the_shared_path_is_unchanged_when_no_component_is_configured(self):
+		self.assertEqual(self.rail._payment_component({}), "")
+		self.assertEqual(self.rail._payment_component({"payment_component": ""}), "")
+
+
+class MoneyOlderThanItsSale(unittest.TestCase):
+	"""Settlement tested BOTH ends of the window, not one.
+
+	Until 2026-08-31 `settle` checked only `block_time <= expires_at`, so a
+	deposit dated a day before the sale existed settled it. The cursor is what
+	is supposed to make that unreachable -- but `chain._get_sse` treats a
+	timeout with frames already in hand as the end of a replay and cannot tell
+	a finished replay from a truncated one, so a short baseline over a long
+	history puts pre-existing money after the cursor. Found by an adversarial
+	review and reproduced before it was believed.
+	"""
+
+	CREATED = 1_000_000
+	EXPIRES = 1_000_900
+
+	def _decision(self, block_time):
+		rail = OotleEsmeralda()
+		recipient = "component_" + "e" * 54
+		intent = PaymentIntent(
+			"SALE", rail.key, recipient, 5_000_000, self.CREATED, self.EXPIRES,
+			baseline=RecipientBaseline(rail.key, recipient, "https://i.example", 100),
+		)
+		transfer = TransferObservation("d" * 64, 5_000_000, True, 1, block_time_epoch=block_time)
+		batch = ObservationBatch(
+			rail.key, intent.intent_id, recipient, "https://i.example",
+			100, 200, 100, 200, (transfer,), finalized_tip=200,
+		)
+		return rail.settle(intent, batch, frozenset())
+
+	def test_money_that_arrived_during_the_sale_settles_it(self):
+		self.assertEqual(self._decision(self.CREATED + 100).state, SETTLED)
+
+	def test_money_older_than_the_sale_does_not_settle_it(self):
+		decision = self._decision(self.CREATED - 86_400)
+		self.assertEqual(decision.state, NEEDS_REVIEW)
+		self.assertEqual(decision.credited_native, 0)
+
+	def test_ordinary_clock_skew_still_settles(self):
+		"""THE CONTROL, and the reason the bound is not zero.
+
+		D19 was a nine-hour timezone error that made every real payment look
+		late and was invisible to a fully green suite. A tight lower bound here
+		would be that defect wearing the opposite sign, so half an hour of
+		disagreement between a chain's clock and this host's must still settle.
+		"""
+		self.assertEqual(self._decision(self.CREATED - 1800).state, SETTLED)
+
+	def test_the_skew_bound_is_exactly_an_hour_and_the_edge_is_inside_it(self):
+		"""The bound is a decision, so it is pinned to the second.
+
+		Both of these survived mutation before they were written: an hour that
+		was silently 3,601 seconds, and a `<=` that was silently `<`, are both
+		invisible to a test that only ever asks about half an hour and a day.
+		A boundary nobody asserts is a boundary that can move on its own.
+		"""
+		self.assertEqual(self._decision(self.CREATED - 3600).state, SETTLED)
+		self.assertEqual(self._decision(self.CREATED - 3601).state, NEEDS_REVIEW)
+
+
+class _PagedStubReader(_StubReader):
+	"""A stub that honours `after_id`, so a drain can actually terminate.
+
+	`_StubReader` returns one fixed payload whatever the cursor, which is fine
+	for a single observation and wrong for a baseline: the second page would
+	replay ids the first already delivered and `_event_replay` would refuse
+	them. Pages keyed by cursor is what a real endpoint does.
+	"""
+
+	def __init__(self, pages, outcome="Commit"):
+		super().__init__(b":\n", outcome)
+		self._pages = pages
+		self.asked = []
+
+	def _get_sse(self, path):
+		after = int(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["after_id"][0])
+		self.asked.append(after)
+		return self._pages.get(after, b":\n"), None
+
+
+class PaymentComponentBoundaries(unittest.TestCase):
+	"""What the component path REFUSES, which is most of what it is for.
+
+	A payment component is the per-sale binding (D49-D54) and its refusals had
+	no test at all when this file's coverage gate was first run against it --
+	nine lines of the newest and most safety-bearing code in the rail, every
+	one of them a refusal. A refusal nobody has seen fire is a refusal nobody
+	knows is there.
+	"""
+
+	def setUp(self):
+		self.rail = OotleEsmeralda()
+		self.configuration = {"endpoint": _INDEXER, "payment_component": _COMPONENT}
+
+	def _reader(self, reader):
+		patch = mock.patch.object(OotleEsmeralda, "_reader", lambda _self, _cfg: reader)
+		patch.start()
+		self.addCleanup(patch.stop)
+		return reader
+
+	def _event(self, body, topic=OOTLE_PAYMENT_TOPIC):
+		return ((1, topic, body),)
+
+	def _payment_body(self, **payload):
+		merged = {"sale_ref": "SALE-A", "amount": "5000000"}
+		merged.update(payload)
+		return {
+			"transaction_id": "a" * 64,
+			"event": {"substate_id": _COMPONENT, "payload": merged},
+		}
+
+	def test_a_baseline_over_a_component_reads_one_page_and_has_no_lifetime(self):
+		"""The component path does NOT drain, and that is the fix, not a gap.
+
+		Here the money names the sale: `_referenced_payments` credits only
+		deposits carrying this sale's reference, and a reference is minted per
+		sale with 57 bits of entropy, so no event that already existed can
+		carry it. The cursor is an optimisation, not the attribution.
+
+		Draining it was actively harmful. Every baseline replays from zero, so
+		a component would have hit the twelve-page bound after roughly its
+		sixtieth event and then refused **every** later sale -- a finite
+		operational lifetime, on the one path this project publishes. Found by
+		a review of this session's own work and reproduced before it was
+		believed.
+		"""
+		history = _payment_stream(*[(index + 1, "OLD-%d" % index, 1) for index in range(200)])
+		reader = self._reader(_PagedStubReader({0: history}))
+		reader.resource_balance = lambda _account, _resource: (0, None)
+		baseline = self.rail.capture_baseline(_COMPONENT, self.configuration)
+		self.assertEqual(baseline.tip, 200)
+		self.assertEqual(baseline.payment_component, _COMPONENT)
+		# One read, not a drain: the second page was never asked for.
+		self.assertEqual(reader.asked, [0])
+
+	def test_an_unreadable_payment_stream_refuses_rather_than_reading_empty(self):
+		reader = self._reader(_StubReader(b""))
+		reader._get_sse = lambda _path: (None, "the indexer did not answer")
+		with self.assertRaises(RailProviderError) as refused:
+			self.rail._payment_events(reader, _COMPONENT, 0)
+		self.assertIn("payment event stream could not be read", refused.exception.reason)
+
+	def test_an_unparseable_payment_stream_refuses(self):
+		reader = self._reader(_StubReader(b"id: 1\ndata: {}\n\n"))
+		with self.assertRaises(RailProviderError) as refused:
+			self.rail._payment_events(reader, _COMPONENT, 0)
+		self.assertIn("event, id, and data", refused.exception.reason)
+
+	def test_a_foreign_topic_on_the_component_stream_is_skipped_not_credited(self):
+		reader = _StubReader(b":\n")
+		events = self._event(self._payment_body(), topic="std.vault.deposit")
+		transfers, warnings, _unresolved = self.rail._referenced_payments(reader, _COMPONENT, events, "SALE-A")
+		self.assertEqual((transfers, warnings), ((), ()))
+
+	def test_every_malformed_payment_event_refuses_rather_than_being_dropped(self):
+		"""Dropping would UNDER-credit a customer who really paid.
+
+		This is the opposite failure to D48's. There, inference credited a sale
+		from money that was not its own; here, silence would deny a sale money
+		that was. Both are wrong and the refusal is the only answer that is not
+		a guess in one direction or the other.
+		"""
+		cases = (
+			({"transaction_id": 7, "event": {}}, "transaction id was malformed"),
+			({"transaction_id": "a" * 64, "event": {"substate_id": _COMPONENT}}, "payload was malformed"),
+			(self._payment_body(sale_ref=""), "carried no sale reference"),
+			(self._payment_body(sale_ref="x" * 129), "sale reference was oversized"),
+			(self._payment_body(amount="0"), "amount was not a positive integer"),
+		)
+		reader = _StubReader(b":\n")
+		for body, wording in cases:
+			with self.subTest(wording=wording), self.assertRaises(RailProviderError) as refused:
+				self.rail._referenced_payments(reader, _COMPONENT, self._event(body), "SALE-A")
+			self.assertIn(wording, refused.exception.reason)
+
+	def test_a_sale_reference_longer_than_the_component_accepts_refuses(self):
+		"""Refused HERE, not sent and lost.
+
+		The component bounds its own argument, so an oversized reference is a
+		payment instruction the payer could never satisfy. Refusing at request
+		time means nobody is told to send money that can never be attributed.
+		"""
+		intent = PaymentIntent(
+			"sale-long",
+			self.rail.key,
+			_COMPONENT,
+			5_000_000,
+			1_000,
+			9_999_999_999,
+			payment_reference="x" * 129,
+			baseline=RecipientBaseline(
+				self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		with self.assertRaises(RailProviderError) as refused:
+			self.rail.create_request(intent)
+		self.assertIn("longer than the component accepts", refused.exception.reason)
+
+	def test_a_baseline_payment_component_must_be_text(self):
+		with self.assertRaises(InvalidRailPlugin):
+			RecipientBaseline(self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=7)
+
+	def test_the_accepted_edge_of_every_bound_is_asserted_not_only_the_refused_one(self):
+		"""A bound with only its refusing side tested can move inwards silently.
+
+		All three survived mutation: a 128-byte limit that had quietly become
+		127 would refuse references the component itself accepts, and an
+		amount test of `<= 1` would drop a one-microTari payment. Nothing in
+		the suite would have said a word, because every case it asked about
+		was far from the edge.
+		"""
+		longest = "x" * MAX_SALE_REF_BYTES
+		reader = _StubReader(b":\n")
+		transfers, _warnings, _unresolved = self.rail._referenced_payments(
+			reader, _COMPONENT, self._event(self._payment_body(sale_ref=longest)), longest
+		)
+		self.assertEqual(len(transfers), 1)
+
+		smallest, _warnings, _unresolved = self.rail._referenced_payments(
+			reader, _COMPONENT, self._event(self._payment_body(amount="1")), "SALE-A"
+		)
+		self.assertEqual(smallest[0].amount_native, 1)
+
+		intent = PaymentIntent(
+			"sale-edge",
+			self.rail.key,
+			_COMPONENT,
+			5_000_000,
+			1_000,
+			9_999_999_999,
+			payment_reference=longest,
+			baseline=RecipientBaseline(
+				self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		self.assertIn(longest, self.rail.create_request(intent).payer_notice)
+
+
+class WhatTheProviderDidNotSay(unittest.TestCase):
+	"""An absence of an answer is not an answer, and must never become one.
+
+	Every case here was found by a cold review of the session that introduced
+	the outcome check, and every one was reproduced before it was fixed. They
+	share a shape: two different facts arriving as the same value, and code
+	that picked the more convenient reading.
+	"""
+
+	def setUp(self):
+		self.rail = OotleEsmeralda()
+
+	def _settle(self, reader, stream):
+		patch = mock.patch.object(OotleEsmeralda, "_reader", lambda _self, _cfg: reader)
+		patch.start()
+		self.addCleanup(patch.stop)
+		reader._stream = stream
+		intent = PaymentIntent(
+			"SALE", self.rail.key, _COMPONENT, 5_000_000, 1_000, 9_999_999_999,
+			payment_reference="SALE",
+			baseline=RecipientBaseline(
+				self.rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		configuration = {"endpoint": _INDEXER, "payment_component": _COMPONENT}
+		observed = self.rail.observe(intent, configuration)
+		return observed, self.rail.settle(intent, observed, frozenset())
+
+	def test_an_unreadable_transaction_keeps_the_sale_pending_not_refused(self):
+		"""One HTTP 503 used to cost a customer a sale they had paid for.
+
+		`needs-review` is terminal (D10) and the sweep never reopens it, so a
+		transient failure on the transaction read was a permanent verdict --
+		and the indexer recovering a second later changed nothing. Pending is
+		the honest state: nothing was decided, so keep polling and let the
+		sale's own expiry end it if the reads never recover.
+		"""
+		reader = _StubReader(b":\n")
+		reader._get = lambda _path: (
+			({"network": "esmeralda", "epoch": 10776}, None)
+			if _path == "network"
+			else (None, "the indexer answered 503 for " + _path)
+		)
+		observed, decision = self._settle(reader, _payment_stream((201, "SALE", 5_000_000)))
+		self.assertEqual(decision.state, PENDING)
+		self.assertEqual(decision.credited_native, 0)
+		self.assertIn("did not answer whether", decision.reason)
+		self.assertIn("retried, not refused", decision.reason)
+		# And the warning must not claim a fact nobody established.
+		self.assertIn("could not be read", observed.warnings[0])
+		self.assertNotIn("moved no money", observed.warnings[0])
+
+	def test_a_body_for_a_different_transaction_certifies_nothing(self):
+		"""The outcome check must prove it looked at the right transaction.
+
+		A cache or proxy answering with another transaction would otherwise
+		pair THIS event's amount with THAT transaction's `Commit` and
+		timestamp, and settle on a body it had never checked.
+		"""
+		reader = _StubReader(b":\n")
+		reader._get = lambda _path: (
+			({"network": "esmeralda", "epoch": 10776}, None)
+			if _path == "network"
+			else (
+				{"transaction": {
+					"transaction_id": "f" * 64,
+					"summary": {"outcome": "Commit", "finalized_at": "2026-08-31 04:12:19.0"},
+				}},
+				None,
+			)
+		)
+		observed, decision = self._settle(reader, _payment_stream((201, "SALE", 5_000_000)))
+		self.assertEqual(decision.state, PENDING)
+		self.assertEqual(decision.credited_native, 0)
+		self.assertIn("answered with", observed.warnings[0])
+
+	def test_a_recovered_read_resolves_a_sale_that_was_pending(self):
+		"""THE CONTROL. Doubt must not be permanent either.
+
+		If an unresolved transaction stayed unresolved once recorded, the
+		remedy for a terminal refusal would be a sale that never settles --
+		the same defect wearing the other sign.
+		"""
+		reader = _StubReader(b":\n")
+		observed, decision = self._settle(reader, _payment_stream((201, "SALE", 5_000_000)))
+		self.assertEqual(decision.state, SETTLED)
+		self.assertEqual(observed.unresolved_transaction_ids, ())
+
+	def test_doubt_about_extra_money_does_not_hold_back_a_paid_sale(self):
+		"""`credited < amount` is strict, and the strictness is the point.
+
+		A sale fully covered by transactions that DID resolve is settled. An
+		unresolved extra deposit alongside it is somebody else's problem --
+		holding the sale pending for it would let one unreadable stranger's
+		transaction freeze a customer who has paid in full.
+		"""
+		rail = OotleEsmeralda()
+		baseline = RecipientBaseline(rail.key, ACCOUNT, ENDPOINT, 5)
+		intent = PaymentIntent(
+			"sale-1", rail.key, ACCOUNT, 60, FINALIZED_EPOCH - 60, FINALIZED_EPOCH + 60,
+			baseline=baseline,
+		)
+		paid = TransferObservation(TX, 60, True, 1, block_time_epoch=FINALIZED_EPOCH)
+		doubtful = TransferObservation(TX_TWO, 5, False, 0)
+		batch = ObservationBatch(
+			rail.key, "sale-1", ACCOUNT, ENDPOINT, 5, 7, 5, 7,
+			(paid, doubtful), unresolved_transaction_ids=(TX_TWO,),
+		)
+		self.assertEqual(rail.settle(intent, batch).state, SETTLED)
+
+
+class DoubtIsNotPermanent(unittest.TestCase):
+	"""A transaction that could not be read once and reads cleanly later.
+
+	The remedy for "a transient failure is a terminal refusal" must not be
+	"a transient failure is a sale that never settles". `extend` therefore
+	DROPS a transaction from the unresolved set the moment a later page
+	reports it confirmed, rather than accumulating every doubt ever held.
+	"""
+
+	def test_the_next_poll_re_reads_what_the_last_one_could_not(self):
+		"""The whole point, and it is an outcome and not a wording.
+
+		The cursor advances past an event once seen, and `extend` refuses a
+		page repeating a transaction id -- so without an explicit retry the
+		sale merely stops being wrongly REFUSED and starts quietly EXPIRING,
+		which costs the customer exactly the same. The second poll must ask
+		about the transaction again and settle it.
+		"""
+		rail = OotleEsmeralda()
+		unread = ObservationBatch(
+			rail.key, "SALE", _COMPONENT, _INDEXER, 0, 201, 0, 201,
+			(TransferObservation("%064x" % 201, 5_000_000, False, 0),),
+			warnings=("transaction %064x could not be read, so whether it committed is unknown: 503" % 201,),
+			finalized_tip=201,
+			unresolved_transaction_ids=("%064x" % 201,),
+		)
+		intent = PaymentIntent(
+			"SALE", rail.key, _COMPONENT, 5_000_000, 1_000, 9_999_999_999,
+			payment_reference="SALE",
+			baseline=RecipientBaseline(
+				rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		self.assertEqual(rail.settle(intent, unread, frozenset()).state, PENDING)
+
+		# The indexer recovers. Nothing new arrives -- the stream is empty --
+		# and the sale must still settle on the money it already saw.
+		reader = _StubReader(b":\n")
+		with mock.patch.object(OotleEsmeralda, "_reader", lambda _s, _c: reader):
+			again = rail.observe(intent, {"endpoint": _INDEXER, "payment_component": _COMPONENT}, unread)
+			decision = rail.settle(intent, again, frozenset())
+		self.assertEqual(again.unresolved_transaction_ids, ())
+		self.assertEqual(again.warnings, ())
+		self.assertEqual(decision.state, SETTLED)
+		self.assertEqual(decision.credited_native, 5_000_000)
+
+	def test_a_still_unreadable_transaction_stays_pending_rather_than_settling(self):
+		"""THE CONTROL. A retry that always resolves would be no check at all."""
+		rail = OotleEsmeralda()
+		unread = ObservationBatch(
+			rail.key, "SALE", _COMPONENT, _INDEXER, 0, 201, 0, 201,
+			(TransferObservation("%064x" % 201, 5_000_000, False, 0),),
+			finalized_tip=201,
+			unresolved_transaction_ids=("%064x" % 201,),
+		)
+		intent = PaymentIntent(
+			"SALE", rail.key, _COMPONENT, 5_000_000, 1_000, 9_999_999_999,
+			payment_reference="SALE",
+			baseline=RecipientBaseline(
+				rail.key, _COMPONENT, _INDEXER, 0, payment_component=_COMPONENT
+			),
+		)
+		reader = _StubReader(b":\n")
+		reader._get = lambda path: (
+			({"network": "esmeralda", "epoch": 10776}, None)
+			if path == "network"
+			else (None, "the indexer answered 503 for " + path)
+		)
+		with mock.patch.object(OotleEsmeralda, "_reader", lambda _s, _c: reader):
+			again = rail.observe(intent, {"endpoint": _INDEXER, "payment_component": _COMPONENT}, unread)
+			decision = rail.settle(intent, again, frozenset())
+		self.assertEqual(again.unresolved_transaction_ids, ("%064x" % 201,))
+		self.assertEqual(decision.state, PENDING)
+

@@ -1,6 +1,6 @@
 [project]
 name = "cryptopos-rail-ootle"
-version = "0.1.0"
+version = "0.2.0"
 description = "A dependency-free Tari Ootle (esmeralda) XTR payment rail for CryptoPoS."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -11,9 +11,12 @@ license = { text = "MIT" }
 # into an environment where it could not run. A range rather than a pin: these
 # rails use the PaymentRail protocol and the address and URI helpers, all of
 # which are covered by core's frozen API, so a core patch release must not force
-# a release here. The `<2` ceiling is deliberate -- a major core release is
-# where those helpers could move, and an unbounded range would let a resolver
-# pair this wheel with a core that no longer has them.
+# a release here. The `<3` CEILING is what is deliberate -- a major core release
+# is where those helpers could move, and an unbounded range would let a resolver
+# pair this wheel with a core that no longer has them. (This paragraph said
+# "`<2` ceiling" until 2026-08-31, contradicting the declaration three lines
+# down. It was true before the 2.0 split and became a comment describing a
+# constraint that had been replaced by its opposite.)
 # `>=2`, NOT `>=1.1`, and that was measured rather than reasoned. Core 1.1
 # ships these adapters itself and declares its own `cryptopos.rails` entry
 # points for them, so installing this package beside it registers one rail key
@@ -25,7 +28,14 @@ license = { text = "MIT" }
 # That is not a degraded mode -- discovery fails outright, so a host loses every
 # rail, not just the duplicated one. A `<2` ceiling would have permitted exactly
 # that combination. This package is a core 2.0 artifact and says so.
-dependencies = ["cryptopos-core>=2,<3"]
+# `>=2.1`, NOT `>=2`, and the floor moved for a reason a resolver must know.
+# This rail passes `unresolved_transaction_ids` to `ObservationBatch`, an
+# optional field core added in 2.1 so a rail could say "the provider did not
+# answer" as something distinct from "the provider said no". Against core 2.0
+# that keyword is a TypeError at the first observation -- an install that
+# succeeds and a rail that fails on the first sale, which is D43's shape
+# exactly. A floor is the only thing that stops it.
+dependencies = ["cryptopos-core>=2.1,<3"]
 
 [project.entry-points."cryptopos.rails"]
 ootle-esmeralda-xtr = "cryptopos_rail_ootle:ootle_esmeralda"
@@ -41,7 +51,7 @@ build-backend = "hatchling.build"
 packages = ["src/cryptopos_rail_ootle"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/", "tests/", "pyproject.toml", "README.md"]
+include = ["src/", "tests/", "pyproject.toml", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 110
