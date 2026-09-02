@@ -20,6 +20,8 @@ the fence so that GitHub still syntax-highlights every one of them:
     <!-- readme: new -->     start a fresh namespace; the recipe stands alone
     <!-- readme: skip -->    show it, never run it (needs a chain, funds, a key)
     <!-- readme: raises -->  every line is `expression  # ExceptionName - why`
+                             (only the NAME is checked; the text after it is a
+                             note for the reader, not a claim the gate reads)
 
 An unmarked block continues the previous namespace, so a recipe may be told in
 several fences. A bare expression whose line ends in `# -> value` is evaluated
@@ -333,6 +335,14 @@ def _unpack_wheels(package: pathlib.Path, destination: pathlib.Path):
 		wheels = sorted((project / "dist").glob(f"{distribution}-*.whl"))
 		if not wheels:
 			sys.exit(f"readme: no wheel in {project / 'dist'} — run a build first")
+		if len(wheels) > 1:
+			# CHOOSING IS THE BUG. `wheels[-1]` checked one artefact while pip
+			# might prefer another -- a platform wheel beside a universal one,
+			# or a stale build of an older version. Say so and let a human
+			# clear the directory.
+			names = ", ".join(w.name for w in wheels)
+			sys.exit(f"readme: {project.name}/dist holds several wheels ({names}); "
+			         f"clear it and rebuild so there is one artefact to check")
 		# A STALE WHEEL MUST NOT QUIETLY PASS. --wheel exists to check the
 		# artefact a stranger installs; a dist/ left behind by an older version
 		# would check code this tree no longer contains, and report it green.
