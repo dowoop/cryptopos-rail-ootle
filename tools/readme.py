@@ -404,13 +404,23 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 	failures, ran, skipped = [], 0, 0
 	namespace: dict = {"__name__": "readme"}
 	for index, (mode, block) in enumerate(found, 1):
+		# INVENTORY FIRST, for every mode. Counting markers only inside the
+		# executed branch let a `raises` block carry an arrow claim that
+		# nothing ever read -- the exception was checked and the false claim
+		# beside it sailed through, which is the hole this inventory exists to
+		# close.
+		block_markers = _marker_lines(_comments(block))
+		if mode in ("skip", "raises") and block_markers:
+			failures.append(
+				f"block {index} is a `{mode}` block and carries a `# ->` claim, which nothing "
+				f"can check. Use `# e.g.` for an illustration, or make the block runnable.")
 		if mode == "skip":
 			skipped += 1
 			try:
 				compile(block, str(readme), "exec")          # it must at least be Python
 			except SyntaxError as exc:
 				failures.append(f"block {index} (skipped) is not valid Python: {exc}")
-			if _marker_lines(_comments(block)):
+			if False:
 				failures.append(
 					f"block {index} is skipped but carries a `# ->` claim, which nothing can "
 					f"check. Use `# e.g.` for an illustrative value, or make the block runnable.")
@@ -435,7 +445,7 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 			continue
 		source_lines = block.splitlines()
 		comments = _comments(block)
-		markers = _marker_lines(comments)
+		markers = block_markers
 		checked_lines: set = set()
 		try:
 			tree = ast.parse(block)
