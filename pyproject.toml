@@ -1,6 +1,6 @@
 [project]
 name = "cryptopos-rail-ootle"
-version = "0.2.0"
+version = "0.2.1"
 description = "A dependency-free Tari Ootle (esmeralda) XTR payment rail for CryptoPoS."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -51,7 +51,9 @@ build-backend = "hatchling.build"
 packages = ["src/cryptopos_rail_ootle"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/", "tests/", "pyproject.toml", "README.md", "LICENSE"]
+# `tools/` ships so that a cloner can run the README gate this package's
+# own testing section tells them to run.
+include = ["src/", "tests/", "tools/", "pyproject.toml", "README.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 110
