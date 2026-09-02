@@ -120,6 +120,13 @@ def _claim_lines(statement, source_lines, markers):
 	return lines if lines & markers else set()
 
 
+def _claim_text(statement, source_lines, comments, markers):
+	"""The raw text a bare expression claims, before it is parsed."""
+	lines = sorted(_claim_lines(statement, source_lines, markers))
+	joined = " ".join(comments[line].lstrip("#").strip() for line in lines if line in comments)
+	return joined.split("->", 1)[1].strip() if "->" in joined else ""
+
+
 def _claim_for(statement, source_lines, comments, markers):
 	"""The value a bare expression claims, or _NO_CLAIM.
 
@@ -231,8 +238,14 @@ def _metadata_differences(project: pathlib.Path, archive):
 		built = next((line.split(":", 1)[1].strip()
 		              for line in metadata.splitlines() if line.startswith(f"{field}:")), "")
 		wanted = (_pyproject_field(project, key) or [""])[0]
+		if not wanted and key == "version":
+			# A DYNAMIC VERSION IS STILL A VERSION. `[project].version` is
+			# absent here, and the `if wanted` guard used to skip the check
+			# entirely -- so a wheel could carry METADATA saying 9.9.9 behind a
+			# correctly named file and pass.
+			wanted = _declared_version(project) or ""
 		if wanted and built.replace("_", "-") != wanted.replace("_", "-"):
-			problems.append(f"wheel {field} is {built!r}, pyproject says {wanted!r}")
+			problems.append(f"wheel {field} is {built!r}, the tree says {wanted!r}")
 	built_requires = sorted(
 		line.split(":", 1)[1].strip()
 		for line in metadata.splitlines() if line.startswith("Requires-Dist:"))
@@ -240,6 +253,14 @@ def _metadata_differences(project: pathlib.Path, archive):
 	if built_requires != declared:
 		problems.append(f"wheel requires {built_requires or 'nothing'} but pyproject declares "
 		                f"{declared or 'nothing'}")
+	# The wheel embeds the README as its long description, and that -- not the
+	# working tree -- is what PyPI and `pip show` present. Executing the
+	# working-tree README against the wheel while the wheel ships a different
+	# document is the same staleness this guard exists to refuse.
+	embedded = metadata.split("\n\n", 1)[1] if "\n\n" in metadata else ""
+	on_disk = (project / "README.md").read_text(encoding="utf-8")
+	if embedded.strip() and " ".join(embedded.split()) != " ".join(on_disk.split()):
+		problems.append("the README embedded in the wheel differs from README.md")
 	built_python = next((line.split(":", 1)[1].strip()
 	                     for line in metadata.splitlines() if line.startswith("Requires-Python:")), "")
 	declared_python = ((_pyproject_field(project, "requires-python") or [""]) or [""])[0]
@@ -414,13 +435,16 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 					                f"{claim.text!r} is not a Python literal, so nothing "
 					                f"checked it; actual value is {actual!r}")
 					continue
-				# TYPE AND VALUE. Python equality alone passes `1  # -> True`
-				# and `1  # -> 1.0`, and a reader is shown a representation the
-				# code does not produce.
-				if type(actual) is not type(claim) or actual != claim:
-					failures.append(f"block {index}: {expression} — README says {claim!r} "
-					                f"({type(claim).__name__}), actually produced {actual!r} "
-					                f"({type(actual).__name__})")
+				# REPRESENTATION, not merely equality. Type-and-value still
+				# passed `{"b": 2, "a": 1}  # -> {"a": 1, "b": 2}` and
+				# `-0.0  # -> 0.0`: equal values, different text on the screen.
+				# A claim in this file is what the reader will see, so it is
+				# compared against `repr`.
+				written = " ".join(_claim_text(statement, source_lines, comments, markers).split())
+				produced = " ".join(repr(actual).split())
+				if produced != written:
+					failures.append(f"block {index}: {expression} — README shows {written}, "
+					                f"actually produced {produced}")
 			unaccounted = markers - checked_lines
 			if unaccounted:
 				failures.append(
