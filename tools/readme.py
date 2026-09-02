@@ -33,7 +33,9 @@ import ast
 import configparser
 import io
 import pathlib
+import os
 import re
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -259,8 +261,13 @@ def _metadata_differences(project: pathlib.Path, archive):
 	# document is the same staleness this guard exists to refuse.
 	embedded = metadata.split("\n\n", 1)[1] if "\n\n" in metadata else ""
 	on_disk = (project / "README.md").read_text(encoding="utf-8")
-	if embedded.strip() and " ".join(embedded.split()) != " ".join(on_disk.split()):
-		problems.append("the README embedded in the wheel differs from README.md")
+	# EXACT, apart from a trailing newline. Whitespace is executable content in
+	# a file full of Python, and collapsing it let a wheel embed a README whose
+	# output claim carried a doubled space while comparing equal to the correct
+	# one. An ABSENT description is a difference too, not an exemption.
+	if embedded.rstrip("\n") != on_disk.rstrip("\n"):
+		problems.append("the README embedded in the wheel differs from README.md"
+		                if embedded.strip() else "the wheel embeds no README")
 	built_python = next((line.split(":", 1)[1].strip()
 	                     for line in metadata.splitlines() if line.startswith("Requires-Python:")), "")
 	declared_python = ((_pyproject_field(project, "requires-python") or [""]) or [""])[0]
@@ -353,6 +360,18 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 		return 0
 
 	temporary = None
+	if wheel and os.environ.get("READMEGATE_CHILD") != "1":
+		# A FRESH, ISOLATED INTERPRETER. Rebuilding `sys.path` in this process
+		# does not undo `sys.modules`, a package `__path__` already pointing
+		# elsewhere, an import hook on `sys.meta_path`, or a `sitecustomize`
+		# that ran before this file did. "Only the wheel" is a claim about the
+		# whole interpreter, so it takes a new one: -I ignores the environment
+		# and user site, -S skips site-packages entirely.
+		child = subprocess.run(
+			[sys.executable, "-I", "-S", str(pathlib.Path(__file__).resolve())],
+			env={**os.environ, "READMEGATE_CHILD": "1", "READMEGATE_PACKAGE": str(package)},
+			cwd=str(package))
+		return child.returncode
 	if wheel:
 		# ONLY the wheel. Adding examples/ here made this a hybrid of installed
 		# code and files that exist solely in a checkout, and reported a recipe
@@ -440,8 +459,12 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 				# `-0.0  # -> 0.0`: equal values, different text on the screen.
 				# A claim in this file is what the reader will see, so it is
 				# compared against `repr`.
-				written = " ".join(_claim_text(statement, source_lines, comments, markers).split())
-				produced = " ".join(repr(actual).split())
+				# EXACT. Collapsing runs of whitespace in both sides let
+				# `"a  b"  # -> 'a b'` pass -- the claim and the output differ
+				# by a space inside the string, which is exactly the sort of
+				# thing a reader would copy and be wrong about.
+				written = _claim_text(statement, source_lines, comments, markers)
+				produced = repr(actual)
 				if produced != written:
 					failures.append(f"block {index}: {expression} — README shows {written}, "
 					                f"actually produced {produced}")
@@ -471,6 +494,8 @@ def run(package: pathlib.Path, wheel: bool, show: bool):
 
 
 def main():
+	if os.environ.get("READMEGATE_CHILD") == "1":
+		return run(pathlib.Path(os.environ["READMEGATE_PACKAGE"]), True, False)
 	parser = argparse.ArgumentParser(description="Check that this package's README examples are true.")
 	parser.add_argument("--wheel", action="store_true", help="import from dist/*.whl, not src/")
 	parser.add_argument("--show", action="store_true", help="print the blocks and run nothing")
