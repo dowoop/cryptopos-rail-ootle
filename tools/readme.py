@@ -190,6 +190,32 @@ def _declared_version(package: pathlib.Path):
 	return None
 
 
+_REQUIREMENT = re.compile(
+	r"^\s*(?P<name>[A-Za-z0-9._-]+)\s*(?P<extras>\[[^\]]*\])?\s*(?P<spec>[^;]*?)\s*(?P<marker>;.*)?$")
+
+
+def _normalised_requirement(text: str) -> str:
+	"""`cryptopos-core>=2,<3` and `cryptopos-core<3,>=2` are ONE requirement.
+
+	A wheel's `Requires-Dist` carries the specifier in whatever order the build
+	backend emitted it; `pyproject.toml` carries the author's order. Comparing
+	the two as strings reported every rail's only dependency as a difference on
+	every single build -- and a staleness gate that fires when nothing is stale
+	is one its reader learns to skip, which is the whole value of the gate.
+
+	Sorting the LIST was already done here and is not enough: the difference is
+	inside one requirement, not between two of them.
+	"""
+	match = _REQUIREMENT.match(text)
+	if not match:
+		return text.strip()
+	name = match.group("name").strip().lower().replace("_", "-")
+	extras = ",".join(sorted(e.strip() for e in (match.group("extras") or "").strip("[]").split(",") if e.strip()))
+	specifier = ",".join(sorted(c.strip() for c in match.group("spec").split(",") if c.strip()))
+	marker = " ".join((match.group("marker") or "").split())
+	return f"{name}{'[' + extras + ']' if extras else ''}{specifier}{marker}"
+
+
 def _pyproject_field(project: pathlib.Path, field: str):
 	"""A top-level `[project]` value, as a list.
 
@@ -250,10 +276,9 @@ def _metadata_differences(project: pathlib.Path, archive):
 			wanted = _declared_version(project) or ""
 		if wanted and built.replace("_", "-") != wanted.replace("_", "-"):
 			problems.append(f"wheel {field} is {built!r}, the tree says {wanted!r}")
-	built_requires = sorted(
-		line.split(":", 1)[1].strip()
-		for line in metadata.splitlines() if line.startswith("Requires-Dist:"))
-	declared = sorted(declared_list)
+	built_requires = sorted(_normalised_requirement(line.split(":", 1)[1])
+	                        for line in metadata.splitlines() if line.startswith("Requires-Dist:"))
+	declared = sorted(_normalised_requirement(r) for r in declared_list)
 	if built_requires != declared:
 		problems.append(f"wheel requires {built_requires or 'nothing'} but pyproject declares "
 		                f"{declared or 'nothing'}")
