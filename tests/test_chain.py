@@ -836,8 +836,8 @@ class SlotLayout(unittest.TestCase):
 	layout is pinned rather than inferred.
 
 	The layout was confirmed on chain against component `component_73f1d0bf…`
-	(K1, version 36), and all four resource slots match
-	`ootle-testnet/ADDRESSES.md`. That correspondence is what fixes the
+	(K1, version 36), and all four resource slots match the addresses
+	recorded at deployment. That correspondence is what fixes the
 	mapping; without it the numbers are a guess that happens to parse.
 	"""
 

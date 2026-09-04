@@ -12,7 +12,7 @@ money to check is a limit most people will not check.
 
 The component's state is a positional CBOR array. The mapping below was
 verified against the deployed K1 component by matching all four resource
-slots to ootle-testnet/ADDRESSES.md; a shape that does not match is a
+slots to the addresses recorded at deployment; a shape that does not match is a
 REFUSAL, not a guess. A wrong rate on a screen is worse than no rate at all,
 because it will be believed.
 
