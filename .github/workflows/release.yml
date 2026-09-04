@@ -46,17 +46,18 @@ jobs:
           python-version: ${{ matrix.python }}
 
       # THE README IS THE PyPI PAGE, so a stale install section is a permanent
-      # defect on a page nobody can edit without a new release. `published/
-      # prepare_pypi.py --to-pypi` in the workspace is what rewrites it; this is
-      # the gate that stops a tag being cut before that ran. It is here rather
-      # than in a checklist because the failure ships and cannot be recalled.
+      # defect on a page nobody can edit without a new release. This is the gate
+      # that stops a tag being cut before that section was updated. It is here
+      # rather than in a checklist because the failure ships and cannot be
+      # recalled.
       - name: refuse a README that still says the package is not on PyPI
         run: |
           if grep -q "Not on PyPI yet" README.md; then
             echo "README.md still says 'Not on PyPI yet'."
             echo "It IS this package's PyPI long description, so publishing now would"
             echo "ship a page telling readers the package is not on PyPI."
-            echo "Run: python3 published/prepare_pypi.py --to-pypi   (then rebuild, commit, re-tag)"
+            echo "Replace that install block with the real 'pip install' instructions,"
+            echo "then rebuild, commit and re-tag."
             exit 1
           fi
 
@@ -81,10 +82,10 @@ jobs:
           python -m build
           python -m pip install --quiet dist/*.whl
           # Run from a COPY of tests/ with no src/ beside it, so an import can
-          # only resolve to site-packages. The same reason published/check.sh
-          # --wheel does it: a suite run next to src/ tests the directory, not
-          # the artifact, and core's two packaging tests skip themselves when
-          # they detect the source tree.
+          # only resolve to site-packages. A suite run next to src/ tests the
+          # DIRECTORY rather than the artifact, and core's two packaging tests
+          # skip themselves when they detect a source tree -- so running in
+          # place would quietly check less and still report green.
           mkdir -p /tmp/run && cp -r tests /tmp/run/tests
           cd /tmp/run && python -m unittest discover -s tests -t .
 
