@@ -13,7 +13,7 @@ Loyalty policy and points reads remain the independent
 # resolved to core's version. It now resolves to this package's, which is
 # the honest answer: the operator of an endpoint being polled should be told
 # which rail is polling it, not which protocol library it links against.
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 import json

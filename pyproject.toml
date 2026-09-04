@@ -1,6 +1,8 @@
 [project]
 name = "cryptopos-rail-ootle"
-version = "0.2.1"
+# The version is dynamic because two declarations of this one fact drifted by
+# a patch release, and the module string is what a polled endpoint sees.
+dynamic = ["version"]
 description = "A dependency-free Tari Ootle (esmeralda) XTR payment rail for CryptoPoS."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -46,6 +48,9 @@ Source = "https://github.com/dowoop/cryptopos-rail-ootle"
 [build-system]
 requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/cryptopos_rail_ootle/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cryptopos_rail_ootle"]
