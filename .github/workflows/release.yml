@@ -1,0 +1,106 @@
+name: release
+
+# Publishes cryptopos-rail-ootle to PyPI when a v* tag is pushed.
+#
+# TRUSTED PUBLISHING, so no API token exists anywhere -- not in a repository
+# secret, not on a laptop. GitHub mints a short-lived OIDC token for this exact
+# workflow in this exact repository, and PyPI trades it for an upload. That is
+# why `id-token: write` is here and why the environment name matters: both are
+# part of what PyPI matches against.
+#
+# BEFORE THE FIRST TAG, one thing has to be done by a human on pypi.org, once:
+# create a "pending publisher" at https://pypi.org/manage/account/publishing/
+# with exactly these four values --
+#
+#     PyPI Project Name:  cryptopos-rail-ootle
+#     Owner:              dowoop
+#     Repository name:    cryptopos-rail-ootle
+#     Workflow name:      release.yml
+#     Environment name:   pypi
+#
+# Nothing else about publishing needs a credential. Until that form is filled in
+# the publish step fails with an OIDC error and nothing is uploaded, which is the
+# right failure: no half-published release.
+#
+# ORDER MATTERS ACROSS REPOSITORIES. `cryptopos-core` must be on PyPI before any
+# rail, because a rail declares it as a dependency and pip cannot resolve a rail
+# whose core is not there yet. Tag core, let this finish, then tag the rails.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # THE README IS THE PyPI PAGE, so a stale install section is a permanent
+      # defect on a page nobody can edit without a new release. `published/
+      # prepare_pypi.py --to-pypi` in the workspace is what rewrites it; this is
+      # the gate that stops a tag being cut before that ran. It is here rather
+      # than in a checklist because the failure ships and cannot be recalled.
+      - name: refuse a README that still says the package is not on PyPI
+        run: |
+          if grep -q "Not on PyPI yet" README.md; then
+            echo "README.md still says 'Not on PyPI yet'."
+            echo "It IS this package's PyPI long description, so publishing now would"
+            echo "ship a page telling readers the package is not on PyPI."
+            echo "Run: python3 published/prepare_pypi.py --to-pypi   (then rebuild, commit, re-tag)"
+            exit 1
+          fi
+
+      - name: the tag must match the version being published
+        # SHELL, NOT INLINE PYTHON. The first version of this step used
+        # `python -c "` with a multi-line body, and YAML's block indentation
+        # becomes part of the Python source -- it fails with "unexpected indent"
+        # on the first release, which is the worst moment to find out. Caught by
+        # compiling the extracted body before this was committed.
+        run: |
+          version=$(grep -m1 '^__version__' src/*/__init__.py | sed 's/.*"\(.*\)"/\1/')
+          tag="${GITHUB_REF_NAME#v}"
+          echo "module $version, tag $tag"
+          if [ "$version" != "$tag" ]; then
+            echo "the tag does not match __version__; nothing published"
+            exit 1
+          fi
+
+      - name: install and test against the built wheel, not src/
+        run: |
+          python -m pip install --quiet build
+          python -m build
+          python -m pip install --quiet dist/*.whl
+          # Run from a COPY of tests/ with no src/ beside it, so an import can
+          # only resolve to site-packages. The same reason published/check.sh
+          # --wheel does it: a suite run next to src/ tests the directory, not
+          # the artifact, and core's two packaging tests skip themselves when
+          # they detect the source tree.
+          mkdir -p /tmp/run && cp -r tests /tmp/run/tests
+          cd /tmp/run && python -m unittest discover -s tests -t .
+
+      - name: the README's own examples
+        run: python tools/readme.py
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --quiet build && python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
