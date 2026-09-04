@@ -4,7 +4,10 @@ The rail attributes committed deposits into the recipient account's XTR vault
 to their transaction IDs and exact integer amounts. Ootle commits are final,
 so an attributed deposit needs no later confirmation-depth or reorg gate.
 Loyalty policy and points reads remain the independent
-:class:`cryptopos_core.chain.OotleReader` API.
+:class:`cryptopos_rail_ootle.chain.OotleReader` API. (This said
+`cryptopos_core.chain` until 2026-09-04 — a module that does not exist, left
+behind when this code was split out of core; importing it raises
+ModuleNotFoundError.)
 """
 
 # The distribution version, declared here because a moved module asks for

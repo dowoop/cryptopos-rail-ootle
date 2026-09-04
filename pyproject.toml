@@ -3,10 +3,42 @@ name = "cryptopos-rail-ootle"
 # The version is dynamic because two declarations of this one fact drifted by
 # a patch release, and the module string is what a polled endpoint sees.
 dynamic = ["version"]
-description = "A dependency-free Tari Ootle (esmeralda) XTR payment rail for CryptoPoS."
+# NOT 'dependency-free', which this said until 2026-09-04 while the wheel
+# carried `Requires-Dist: cryptopos-core`. The summary is the one line PyPI
+# shows beside the name, so it was the most-read false claim here.
+description = "A Tari Ootle (esmeralda) XTR payment rail for CryptoPoS: standard library plus cryptopos-core."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+# PEP 639 SPDX form, matching `cryptopos-core`. This said
+# `license = { text = "MIT" }` until 2026-09-04 -- the deprecated table form,
+# which lands in the wheel as a free-text `License:` field where core's lands as
+# `License-Expression: MIT`. Two of these four packages describing the same
+# licence in two different metadata fields is the kind of difference a reader
+# notices and cannot explain.
+license = "MIT"
+# DECLARED, not merely present. The LICENSE file was already reaching the wheel
+# through hatchling's default, which is a behaviour rather than a promise.
+license-files = ["LICENSE"]
+
+# EVERY VERSION HERE WAS RUN, not inferred from `requires-python`. On
+# 2026-09-04 the full suite was installed from this wheel and executed on
+# CPython 3.9.25, 3.10.20, 3.11.15, 3.12.13, 3.13.14 and 3.14.4 -- 686 tests
+# across the four packages, twice each, the second pass turning
+# DeprecationWarning and SyntaxWarning into errors. A trove classifier is a
+# support claim, and claiming a version nobody ran is how it becomes false.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Office/Business :: Financial :: Point-Of-Sale",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
 
 # ONE DEPENDENCY, AND IT IS DECLARED. `cryptopos-rail-solana` 0.1.0 shipped with
 # `dependencies = []` while importing four core modules, so it installed cleanly

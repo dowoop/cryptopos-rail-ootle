@@ -12,7 +12,11 @@ pip install git+https://github.com/dowoop/cryptopos-rail-ootle
 
 **Not on PyPI yet**, so `pip install cryptopos-rail-ootle` does not resolve — the repository is the
 distribution until the name is registered. Core comes first: this package declares
-`cryptopos-core>=2,<3` and there is no index for pip to satisfy that from.
+`cryptopos-core>=2.1,<3` and there is no index for pip to satisfy that from.
+(This file said `>=2,<3` until 2026-09-04. The floor moved to 2.1 when this
+rail began passing `unresolved_transaction_ids`; against a real core 2.0 tree
+its suite produces 39 errors, so the looser range was a compatibility promise
+the package itself refuses to honour.)
 
 Installing it *is* the integration — it registers itself through the
 `cryptopos.rails` entry-point group, and a host that calls `discover()` finds it
@@ -77,8 +81,14 @@ with no code change.
 
 # Cookbook
 
-The five-call sequence, the settlement states, and the four host obligations are
-in [cryptopos-core's cookbook](https://github.com/dowoop/cryptopos-core#the-five-calls).
+The five-call sequence, the settlement states, and the **five** host obligations
+are in [cryptopos-core's cookbook](https://github.com/dowoop/cryptopos-core#the-five-calls)
+— the obligations have their own heading at
+[Five host obligations](https://github.com/dowoop/cryptopos-core#five-host-obligations).
+This said *four* until 2026-09-04, and the one it left out is the fifth:
+`needs-review` is a real outcome and needs somewhere to go. A host that
+implemented the four it was told about can collect, persist and claim money
+correctly and still have nowhere for the money a human must look at.
 This file covers only what is specific to Ootle.
 
 ## 1. Configure it
